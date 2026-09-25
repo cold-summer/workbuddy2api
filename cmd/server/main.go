@@ -353,6 +353,15 @@ func main() {
 			cfg.Budget.DailyCreditLimit)
 	}
 
+	// 请求统计的落盘与保留期：必须在 NewHandler 之前初始化——handler 的 /v1/stats
+	// 依赖它恢复出的累计值与小时桶。
+	server.InitMetrics(cfg.Metrics.File, cfg.Metrics.RetentionDays)
+	if cfg.Metrics.File == "" {
+		log.Printf("请求统计：纯内存模式（metrics.file 为空，网关重启即清零）")
+	} else {
+		log.Printf("请求统计：落盘 %s，小时桶保留 %d 天", cfg.Metrics.File, cfg.Metrics.RetentionDays)
+	}
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -439,6 +448,8 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
+		// 统计落盘：与账号池 state 同性质——丢了不影响转发，但趋势图会缺一截。
+		server.FlushMetrics()
 		// Flush 已把最后一笔状态快照提交给 Redis（fire-and-forget）；store.Close
 		// 等 Upstash 在途/排队写排空再关连接——最后一笔镜像必须写完才退出（发现 4）。
 		// Noop 的 Close 是空操作；单写上限 5s × 上限 8，Close 内部另有超时兜底。

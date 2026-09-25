@@ -49,6 +49,18 @@ type Config struct {
 
 	Server struct{} `json:"server"` // 已退役段：max_body_mb 移除后无字段；旧配置该段下任意键因 JSON 未知字段而自然忽略
 
+	// Metrics 请求统计（/v1/stats）的落盘与保留期。
+	//
+	// 为什么不复用上面已退役的 server 段：那段是历史包袱（max_body_mb 移除后留空壳），
+	// 往里塞新键会让「已退役」的注释变成谎话。
+	Metrics struct {
+		// File 统计落盘文件；空 = 纯内存（重启清零）。
+		// 相对路径按进程工作目录解析（systemd 下 = WorkingDirectory）。
+		File string `json:"file"`
+		// RetentionDays 小时桶保留天数（默认 30）。超期桶在记录时与启动时各清一次。
+		RetentionDays int `json:"retention_days"`
+	} `json:"metrics"`
+
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
 		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。
@@ -202,17 +214,17 @@ type Config struct {
 	} `json:"upstash"`
 
 	Pool struct {
-		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
-		MaxInFlightGlobal  int     `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
-		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
-		BreakerCooldown    string  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
-		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
+		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）：
 		// ErrClient/传输层这类「不罚号」失败连续计数，达阈临时出池。与冷却/熔断
 		// 并存取更长者不叠加。默认 5 次 / 10m。
-		DegradeThreshold   int    `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
-		DegradeCooldown    string `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
-		DegradeCooldownMax string `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
+		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+		DegradeCooldown    string  `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
+		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
@@ -262,6 +274,9 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
+	// 请求统计默认落盘：面板承诺「网关重启不清零」，纯内存做不到。
+	c.Metrics.File = "./data/metrics.json"
+	c.Metrics.RetentionDays = server.DefaultRetentionDays
 	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
 	// 消除 issue #49 的默认值漂移）。
 	c.Schedule = config.DefaultSchedule()
@@ -353,6 +368,14 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
+	}
+	if v := os.Getenv("WB2A_METRICS_FILE"); v != "" {
+		c.Metrics.File = v
+	}
+	if v := os.Getenv("WB2A_METRICS_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Metrics.RetentionDays = n
+		}
 	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
@@ -499,6 +522,17 @@ func (c *Config) normalize() error {
 	// 空值回落默认 2h（Default() 已置值；此兜底覆盖显式 "" 与 Default() 被绕过的场景）。
 	if c.Cooldown.SoftRateMax == "" {
 		c.Cooldown.SoftRateMax = "2h"
+	}
+	// metrics.file **不**在此回落默认：空串是「纯内存、重启清零」的显式选择，
+	// 强制填回默认会让这个开关没法关。Default() 已给非空默认值，旧 config.json
+	// 没有该段也拿得到它。
+	if c.Metrics.RetentionDays <= 0 {
+		c.Metrics.RetentionDays = server.DefaultRetentionDays
+	}
+	// 上限钳制：写超了不报错（统计是观测配置，不值得为它拒绝启动），但钳到一年
+	// 以内——手滑写个 3650 会让桶数上限涨到 87600，内存和落盘文件跟着涨一个数量级。
+	if c.Metrics.RetentionDays > server.MaxRetentionDays {
+		c.Metrics.RetentionDays = server.MaxRetentionDays
 	}
 	if c.SoftRateMaxDur, err = time.ParseDuration(c.Cooldown.SoftRateMax); err != nil {
 		return fmt.Errorf("cooldown.soft_rate_max: %w", err)

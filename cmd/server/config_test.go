@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"workbuddy2api/internal/server"
 )
 
 func TestDefault(t *testing.T) {
@@ -747,5 +749,90 @@ func TestPromptInvalidModeStillErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "custom / append / passthrough") {
 		t.Errorf("error should mention (custom / append / passthrough): %v", err)
+	}
+}
+
+// TestMetricsRetentionClamp 保留期越界钳制。
+//
+// 上限存在的意义是防手滑：retention_days 写成 3650（十年）不报错，但桶数上限会从
+// 720 涨到 87600，内存和落盘文件跟着涨一个数量级。统计是观测配置，不值得为它拒绝
+// 启动，所以钳制而不是报错。
+func TestMetricsRetentionClamp(t *testing.T) {
+	cases := []struct {
+		in   int
+		want int
+	}{
+		{0, server.DefaultRetentionDays},
+		{-5, server.DefaultRetentionDays},
+		{7, 7},
+		{server.DefaultRetentionDays, server.DefaultRetentionDays},
+		{server.MaxRetentionDays, server.MaxRetentionDays},
+		{server.MaxRetentionDays + 1, server.MaxRetentionDays},
+		{3650, server.MaxRetentionDays},
+	}
+	for _, tc := range cases {
+		c := Default()
+		c.Metrics.RetentionDays = tc.in
+		if err := c.normalize(); err != nil {
+			t.Fatalf("normalize(retention=%d): %v", tc.in, err)
+		}
+		if c.Metrics.RetentionDays != tc.want {
+			t.Errorf("retention_days %d → %d want %d", tc.in, c.Metrics.RetentionDays, tc.want)
+		}
+	}
+}
+
+// TestMetricsDefaults 统计落盘默认开启，且旧 config.json（无 metrics 段）也能拿到默认值。
+func TestMetricsDefaults(t *testing.T) {
+	c := Default()
+	if c.Metrics.File == "" {
+		t.Errorf("metrics.file 默认不应为空（纯内存会让「网关重启不清零」落空）")
+	}
+	if c.Metrics.RetentionDays != server.DefaultRetentionDays {
+		t.Errorf("retention_days = %d want %d", c.Metrics.RetentionDays, server.DefaultRetentionDays)
+	}
+
+	// 旧配置没有 metrics 段：Load 从 Default() 起步，应保留默认。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "old.json")
+	if err := os.WriteFile(fp, []byte(`{"listen":":9999"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Metrics.File != c.Metrics.File || old.Metrics.RetentionDays != c.Metrics.RetentionDays {
+		t.Errorf("旧配置未拿到默认值: %+v", old.Metrics)
+	}
+
+	// 显式 file:"" 是「纯内存」的开关，不该被 normalize 填回默认。
+	fp2 := filepath.Join(dir, "mem.json")
+	if err := os.WriteFile(fp2, []byte(`{"metrics":{"file":""}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mem, err := Load(fp2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mem.Metrics.File != "" {
+		t.Errorf("metrics.file = %q want 空串（显式关掉落盘）", mem.Metrics.File)
+	}
+}
+
+// TestMetricsEnvOverride 环境变量覆盖落盘路径与保留期。
+func TestMetricsEnvOverride(t *testing.T) {
+	t.Setenv("WB2A_METRICS_FILE", "/tmp/x/metrics.json")
+	t.Setenv("WB2A_METRICS_RETENTION_DAYS", "7")
+
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Metrics.File != "/tmp/x/metrics.json" {
+		t.Errorf("file = %q want /tmp/x/metrics.json", c.Metrics.File)
+	}
+	if c.Metrics.RetentionDays != 7 {
+		t.Errorf("retention_days = %d want 7", c.Metrics.RetentionDays)
 	}
 }

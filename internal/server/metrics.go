@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -56,11 +57,24 @@ var globalMetrics = &metricsStore{
 	byModel: make(map[string]*modelMetrics),
 }
 
-// recordChatMetric 把一次请求的观测累加进聚合表。由 chatStat.done() 调用。
+// recordChatMetric 把一次请求的观测累加进统计。由 chatStat.done() 调用。
+//
+// 写两个去处：**累计表**（/v1/stats 的 total/models）与**当前小时桶**
+// （/v1/stats?range=... 的时间趋势）。两处共用 modelMetrics.add —— 各写一份累加
+// 逻辑，日后改一处漏一处就会出现「总览与趋势对不上」，故由 add 单点承担口径。
 //
 // total 为端到端耗时（TTFB 与生成吞吐的分母口径均由此派生）。模型名为空/"-" 时
 // 归入 "-" 键（仍计入 total，不丢弃观测）。
 func recordChatMetric(s *chatStat, total time.Duration) {
+	recordChatMetricAt(s, total, time.Now())
+}
+
+// recordChatMetricAt 是 recordChatMetric 的可注入时刻版本。
+//
+// 抽出它是为了测试：跨小时/跨天/跨周的桶必须能构造在指定时刻上，否则时间维度
+// 的用例只能靠「等到下一个整点」或改系统时钟。now 同时传给累计与桶，保证
+// lastSeen 一致。
+func recordChatMetricAt(s *chatStat, total time.Duration, now time.Time) {
 	model := s.model
 	if model == "" {
 		model = "-"
@@ -68,21 +82,34 @@ func recordChatMetric(s *chatStat, total time.Duration) {
 
 	m := globalMetrics
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	mm, ok := m.byModel[model]
-	if !ok {
-		if len(m.byModel) >= metricsCap {
-			if !m.warned {
-				m.warned = true
-				logMetricsCapWarn(model)
-			}
-			return
-		}
-		mm = &modelMetrics{}
-		m.byModel[model] = mm
+	if mm := m.slotLocked(model); mm != nil {
+		mm.add(s, total, now)
 	}
+	m.mu.Unlock()
 
+	globalSeries.record(model, s, total, now)
+}
+
+// slotLocked 取（必要时新建）模型累加槽；容量超限返回 nil 并只告警一次。
+// 调用方必须已持锁。
+func (m *metricsStore) slotLocked(model string) *modelMetrics {
+	if mm, ok := m.byModel[model]; ok {
+		return mm
+	}
+	if len(m.byModel) >= metricsCap {
+		if !m.warned {
+			m.warned = true
+			logMetricsCapWarn(model)
+		}
+		return nil
+	}
+	mm := &modelMetrics{}
+	m.byModel[model] = mm
+	return mm
+}
+
+// add 把一次请求的观测累加进累加器。累计表与小时桶共用此函数（见 recordChatMetric）。
+func (mm *modelMetrics) add(s *chatStat, total time.Duration, now time.Time) {
 	mm.requests++
 	if s.status == 200 {
 		mm.success++
@@ -128,7 +155,31 @@ func recordChatMetric(s *chatStat, total time.Duration) {
 		mm.credit += s.credit
 	}
 
-	mm.lastSeen = time.Now()
+	mm.lastSeen = now
+}
+
+// mergeFrom 把 src 的累加值并入 dst（跨桶 / 跨模型汇总用）。
+//
+// 与 add 的分工：add 吃「一次请求的观测」，mergeFrom 吃「另一份累加值」。
+// 字段必须与 add 一一对应——漏一个字段就会出现「趋势之和对不上总览」。
+func (mm *modelMetrics) mergeFrom(src *modelMetrics) {
+	mm.requests += src.requests
+	mm.success += src.success
+	mm.failed += src.failed
+	mm.streaming += src.streaming
+	mm.ttfbSumMS += src.ttfbSumMS
+	mm.ttfbCount += src.ttfbCount
+	mm.latSumMS += src.latSumMS
+	mm.genSecSum += src.genSecSum
+	mm.promptTok += src.promptTok
+	mm.compTok += src.compTok
+	mm.cacheHit += src.cacheHit
+	mm.cacheMiss += src.cacheMiss
+	mm.cacheWrite += src.cacheWrite
+	mm.credit += src.credit
+	if src.lastSeen.After(mm.lastSeen) {
+		mm.lastSeen = src.lastSeen
+	}
 }
 
 // MetricsSnapshot 是 /v1/stats 的响应载荷（字段名与社区面板约定一致）。
@@ -140,6 +191,12 @@ type MetricsSnapshot struct {
 	UptimeSec int64              `json:"uptime_sec"`
 	Total     ModelStatPayload   `json:"total"`
 	Models    []ModelStatPayload `json:"models"`
+	// SeriesBuckets 时间序列保留的小时桶数，面板据此展示「数据可回溯到何时」。
+	SeriesBuckets int `json:"series_buckets"`
+	// Range 时间维度查询结果；仅当请求带了 range/from/to/interval/model 时返回
+	// （omitempty：不带参数的调用与旧版响应逐字段一致，面板按有无此字段决定
+	// 是画趋势图还是走「网关不支持」的降级提示）。
+	Range *RangeResult `json:"range,omitempty"`
 }
 
 // ModelStatPayload 单模型派生统计。
@@ -188,6 +245,8 @@ func MetricsSnapshotOf() MetricsSnapshot {
 		Now:       now,
 		UptimeSec: int64(now.Sub(m.since).Seconds()),
 		Models:    make([]ModelStatPayload, 0, len(m.byModel)),
+		// 锁序 metrics → series（见 metrics_series.go 的 save 注释）。
+		SeriesBuckets: SeriesBuckets(),
 	}
 
 	// total 由各模型累加得出（与 models 同口径，避免两处算法分叉）。
@@ -262,6 +321,9 @@ func deriveModelStat(name string, mm *modelMetrics) ModelStatPayload {
 }
 
 // ResetMetrics 清空聚合（/v1/stats/reset），便于观察增量。since 重置为当前时刻。
+//
+// 时间序列一并清空：面板的「重置统计」语义是「从此刻重新开始看」，
+// 只清累计值会让趋势图还留着旧数据，两张卡片对不上。
 func ResetMetrics() {
 	m := globalMetrics
 	m.mu.Lock()
@@ -269,6 +331,8 @@ func ResetMetrics() {
 	m.byModel = make(map[string]*modelMetrics)
 	m.since = time.Now()
 	m.warned = false
+	// 锁序 metrics → series（见 metrics_series.go 的 save 注释）。
+	globalSeries.reset()
 }
 
 // logMetricsCapWarn 容量超限告警（独立函数便于测试替换/断言，也避免 import log 污染
@@ -347,10 +411,82 @@ func intFromUsage(u map[string]any, key string) int {
 
 // stats 处理 GET /v1/stats：返回按模型聚合的请求统计（社区面板数据源）。
 // 聚合口径不变；出口处只读合入模型目录的积分倍率（enrichCredits，无上游调用）。
+//
+// 带时间参数时（?range= 或 ?from=&to=）额外返回 range 字段的时间序列，供面板画
+// 「时间趋势」。不带参数时响应与旧版逐字段一致（range 被 omitempty 省略）。
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	snap := MetricsSnapshotOf()
 	h.enrichCredits(&snap)
+	if q, ok := parseRangeQuery(r); ok {
+		res := MetricsRange(q)
+		snap.Range = &res
+	}
 	writeJSON(w, http.StatusOK, snap)
+}
+
+// parseRangeQuery 解析时间范围参数；无任何时间参数时返回 ok=false（只返回累计统计）。
+//
+// 支持的写法：
+//
+//	?range=today|yesterday|7d|30d|90d|all   相对区间（便捷）
+//	?from=RFC3339&to=RFC3339                绝对区间（精确选择，优先于 range）
+//	?interval=hour|day|week                 聚合粒度（默认 hour）
+//	?model=<name>                           只看单个模型
+//
+// 非法时间/粒度不报错而是回落默认 —— 统计是观测功能，宁可按默认区间返回也不要
+// 400 让面板整页失败。
+func parseRangeQuery(r *http.Request) (RangeQuery, bool) {
+	q := r.URL.Query()
+	query := RangeQuery{
+		Interval: NormalizeInterval(q.Get("interval")),
+		Model:    strings.TrimSpace(q.Get("model")),
+	}
+
+	hasRange := false
+	// 绝对区间优先（用户显式选了时间段）。
+	if v := strings.TrimSpace(q.Get("from")); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			query.From = t
+			hasRange = true
+		}
+	}
+	if v := strings.TrimSpace(q.Get("to")); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			query.To = t
+			hasRange = true
+		}
+	}
+
+	// 相对区间（未给绝对区间时生效）。
+	if !hasRange {
+		now := time.Now()
+		midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+		switch strings.ToLower(strings.TrimSpace(q.Get("range"))) {
+		case "today":
+			query.From, query.To = midnight, midnight.AddDate(0, 0, 1)
+			hasRange = true
+		case "yesterday":
+			query.From, query.To = midnight.AddDate(0, 0, -1), midnight
+			hasRange = true
+		case "7d", "week":
+			query.From = now.AddDate(0, 0, -7)
+			hasRange = true
+		case "30d", "month":
+			query.From = now.AddDate(0, 0, -30)
+			hasRange = true
+		case "90d":
+			query.From = now.AddDate(0, 0, -90)
+			hasRange = true
+		case "all":
+			hasRange = true // 不限 From/To = 保留期内的全部桶
+		}
+	}
+
+	// 只给 model 也算时间维度查询：面板切模型筛选时不该整块退化成累计统计。
+	if query.Model != "" {
+		hasRange = true
+	}
+	return query, hasRange
 }
 
 // statsReset 处理 POST /v1/stats/reset：清空累计，便于观察增量。
