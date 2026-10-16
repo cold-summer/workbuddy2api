@@ -884,8 +884,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 是服务端指令，走本网关的客户端不属于该形态）。此处**轮转循环外**生成一次，
 	// 循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再碎片化（此前网关
 	// 一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个 RequestID）。
-	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造，见
-	//     ResolveConversationID；官方后台不校验一致，空会话则不建立聚合键）；
+	//   - conversationID：body 提取（透传客户端原值）；缺省时在下方用轮级聚合键
+	//     ConversationHeaderID 兜底出站 X-Conversation-ID（渠道校验 11-128 要求该头
+	//     恒在；兜底值只进出站头、不进 prompt_cache_key 会话段，缓存键仍按客户端
+	//     原值——轮级键逐轮变化不会打碎前缀缓存）；
 	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先（客户端已
 	//     有自己的对话轮 ID 则以客户端为准）。派生分两态：
 	//     * turnKey 非空（有末条 user 消息）→ 带会话键客户端走 TurnRequestID(
@@ -912,6 +914,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
 		chatMeta.ConversationRequestID = session.TurnRequestID("")
+	}
+	// 渠道校验 11-128「conversation id missing」修复：上游要求出站 X-Conversation-ID
+	// 恒在（逐账号直连实测：只要头在场即通过，不校验会话存在性）。客户端没带
+	// conversationId 时，用上面已算好的轮级聚合键兜底——同轮内重试/换号/降级复用
+	// 同一会话 ID，与 ConversationRequestID 的聚合语义对齐（#170 统一轮级）。
+	// 只写 ConversationHeaderID 而不覆盖 ConversationID：后者仍是 prompt_cache_key
+	// 会话段的哈希源，保持无会话键客户端的「每账号恒键」前缀缓存命中率不被打碎。
+	if chatMeta.ConversationID == "" {
+		chatMeta.ConversationHeaderID = chatMeta.ConversationRequestID
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
@@ -1372,15 +1383,15 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
 			return
 		}
-		// 渠道校验封禁（11-128 "conversation id missing" / displayTips "channel verification"）：
-		// 与 11140 同属账号级终态——同一账号跨全模型、跨任意请求体 100% 复现（2026-10-16
-		// 实测 11/16 global 号全中），补上会话 ID 也不改变结果，换号是唯一出路。
-		// 硬禁用而非软冷却：冷却到期只会再撞一次、白耗一次轮换，还把「号已被上游封」这一
-		// 事实藏起来。禁用后 /status 以 disabled + disabled_reason 呈现；人工重登后用
-		// /admin/accounts/{uid}/revive 复活。disabled 号不参与选号，且不会被签到解冻
-		// （ReenableIfCredits 显式跳过）或保活刷新自动撤销。
+		// 渠道校验（11-128 "conversation id missing" / displayTips "channel verification"）：
+		// 账号级终态处置，与 11140 同档。⚠️ 2026-10-16 曾把 11/16 global 号误判为
+		// 「上游封禁」并全部硬禁用——真相是网关没发出站 X-Conversation-ID（handler 已
+		// 修复：客户端缺省时用轮级键兜底，该头恒在）。本分支现在只应在「头已带、仍被
+		// 渠道校验拒」时命中（真账号级拦截），处置不变：硬禁用，人工重登后用
+		// /admin/accounts/{uid}/revive 复活（disabled 号不参与选号、不被签到解冻、
+		// 不被保活刷新自动撤销）。
 		if upstream.IsChannelBlocked(body) {
-			h.cfg.Pool.Disable(uid, "account blocked by upstream channel verification (11-128), re-login required")
+			h.cfg.Pool.Disable(uid, "account failed upstream channel verification (11-128) with conversation id present, re-login required")
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")

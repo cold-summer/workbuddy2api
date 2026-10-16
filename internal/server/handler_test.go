@@ -2425,7 +2425,7 @@ func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
 }
 
 // TestStaleSnapshotBoundedByPickGate 粘性快照陈旧被 Pick 闸兜底的契约锚
-//（pr134-watchlist-analysis.md #10）：
+// （pr134-watchlist-analysis.md #10）：
 // session.ResolveForModel 在取任何锁之前拿 pool 可用性快照——若快照后、Pick 前
 // 粘性号 A 被冷却（快照陈旧判 available），Session 层仍会返回 A 作为建议 uid；
 // 但真正的可用性权威闸是 handler 的 Pool.PickByUIDForModel（锁内新鲜判定
@@ -2701,11 +2701,12 @@ func TestHandlerAppendTurnKeyStable(t *testing.T) {
 	}
 }
 
-// TestChatChannelBlockDisables 渠道校验封禁（HTTP 400 + code 11-128 + displayTips
-// "channel verification"，2026-10-16 实测 11/16 个 global 号全中）：账号级终态，
-// 跨模型/跨请求体 100% 复现、补会话 ID 无效 → 与 11140 同样**硬禁用**：同一请求
-// 轮换到下一个号，后续请求直接跳过，不再把轮换浪费在死号上（修复前落 ErrClient
-// 「只换号不罚」，坏号留在池内被反复选中，实测约 1/5 的 global 请求吃 503）。
+// TestChatChannelBlockDisables 渠道校验（HTTP 400 + code 11-128 + displayTips
+// "channel verification"）：与 11140 同样**硬禁用**——同一请求轮换到下一个号，
+// 后续请求直接跳过，不再把轮换浪费在死号上。
+// ⚠️ 2026-10-16 曾把 11/16 个 global 号误判为「上游封禁」——真相是网关没发出站
+// X-Conversation-ID（handler 已修复：缺省时用轮级键兜底恒发）。本用例保留的是
+// 「头已带仍被渠道校验拒」的真账号级拦截路径（防御性处置，期望在修复后基本不触发）。
 func TestChatChannelBlockDisables(t *testing.T) {
 	const blockedBody = `{"code":11-128,"msg":"conversation id missing","requestId":"r1","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client.","zh":"这次调用没通过渠道校验"}}`
 	calls := map[string]int{}
@@ -2737,7 +2738,7 @@ func TestChatChannelBlockDisables(t *testing.T) {
 	if !st.Disabled {
 		t.Fatalf("被封号应被硬禁用（渠道校验需重登，不可自愈）: %+v", st)
 	}
-	wantReason := "account blocked by upstream channel verification (11-128), re-login required"
+	wantReason := "account failed upstream channel verification (11-128) with conversation id present, re-login required"
 	if st.DisabledReason != wantReason {
 		t.Errorf("disabled_reason=%q want %q", st.DisabledReason, wantReason)
 	}
