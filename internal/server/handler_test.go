@@ -2700,3 +2700,59 @@ func TestHandlerAppendTurnKeyStable(t *testing.T) {
 		t.Errorf("X-Conversation-Request-ID=%v want %q (derived from pre-rewrite body)", reqIDs, want)
 	}
 }
+
+// TestChatChannelBlockDisables 渠道校验封禁（HTTP 400 + code 11-128 + displayTips
+// "channel verification"，2026-10-16 实测 11/16 个 global 号全中）：账号级终态，
+// 跨模型/跨请求体 100% 复现、补会话 ID 无效 → 与 11140 同样**硬禁用**：同一请求
+// 轮换到下一个号，后续请求直接跳过，不再把轮换浪费在死号上（修复前落 ErrClient
+// 「只换号不罚」，坏号留在池内被反复选中，实测约 1/5 的 global 请求吃 503）。
+func TestChatChannelBlockDisables(t *testing.T) {
+	const blockedBody = `{"code":11-128,"msg":"conversation id missing","requestId":"r1","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client.","zh":"这次调用没通过渠道校验"}}`
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at-blocked" {
+			return 400, blockedBody, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "blocked", AccessToken: "at-blocked", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	// 让 blocked 积分更高被先选中（与 TestChatAccountFault11140Disables 同一确定性手法）。
+	p.SetCredits("blocked", 2000)
+	p.SetCredits("good", 1000)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 90 * time.Second})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-blocked"] != 1 || calls["Bearer at-good"] != 1 {
+		t.Errorf("calls=%v want blocked/good 各 1 次", calls)
+	}
+	st, _ := p.Status("blocked")
+	if !st.Disabled {
+		t.Fatalf("被封号应被硬禁用（渠道校验需重登，不可自愈）: %+v", st)
+	}
+	wantReason := "account blocked by upstream channel verification (11-128), re-login required"
+	if st.DisabledReason != wantReason {
+		t.Errorf("disabled_reason=%q want %q", st.DisabledReason, wantReason)
+	}
+	if st.Cooling {
+		t.Errorf("硬禁用由 disabled 表达，不应叠加冷却状态: %+v", st)
+	}
+
+	// 禁用生效：后续请求（冷却早过期）也不再选中被封号。
+	before := calls["Bearer at-blocked"]
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec2.Code != 200 {
+		t.Fatalf("second code=%d body=%s", rec2.Code, rec2.Body)
+	}
+	if calls["Bearer at-blocked"] != before {
+		t.Errorf("禁用的账号不应被选中: calls=%v", calls)
+	}
+}

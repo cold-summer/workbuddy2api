@@ -225,6 +225,35 @@ var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, pattern
 	"trial version is not yet activated",
 }}
 
+// channelBlockRule 上游「渠道校验」封禁（账号级终态，2026-10-16 实测）。
+//
+// 形态：HTTP 400 + `{"code":11-128,"msg":"conversation id missing",…,"displayTips":
+// {"en":"This call failed channel verification, possibly because it was not sent from
+// an official client…","zh":"这次调用没通过渠道校验…"}}`。msg 里的 "conversation id
+// missing" 是**幌子**——实测补上会话 ID（body 的 conversationId/metadata.conversation_id，
+// 或 X-Conversation-ID 头）结果完全不变。
+//
+// 实测口径（2026-10-16，逐账号直连上游、绕开网关与账号池）：
+//   - 16 个 global 号中 **11 个** 100% 复现（每个模型、每个请求体、有无会话 ID 全部 400），
+//     另 5 个 100% 成功；同一账号跨模型结论一致 → **账号维度**，既非请求形态也非模型维度。
+//   - 与积分无关（11 个坏号各持约 730 积分，5 个号同样有积分）；cn 域 4 个号全部正常。
+//   - 坏号 token 均为当日新刷、JWT 结构与好号一致 → 不是凭证过期。
+//
+// 故与 11140「request illegal」同属账号级终态：软冷却到期也不会自愈（需重新 OAuth
+// 登录），到期后重新选号只会再撞一次、白耗一次轮换。applyErrorPolicy 按此**硬禁用**。
+//
+// 只认文案、不认 code 11-128：该 code 是上游反探测拦截类的通用码（见 sanitize.go），
+// 单凭它无法与「请求体里回显了 11-128」这类请求级拦截区分。
+var channelBlockRule = errorRule{kind: ErrAccountFault, mode: matchFold, patterns: []string{
+	"channel verification",
+	"渠道校验",
+}}
+
+// IsChannelBlocked 报告 body 是否为渠道校验封禁（账号级，需重登才可能恢复）。
+func IsChannelBlocked(body string) bool {
+	return channelBlockRule.hit(body, strings.ToLower(body))
+}
+
 // promptTooLongRule 11115「prompt is too long」判定（任务书 prompt-too-long §1）。
 // 定位：上下文超限是**请求的问题不是账号的问题**——同一个 body 换任何账号发都会
 // 超限，与 WAF fail-fast 同哲学（确定与账号无关的错误不罚号不轮转，白白浪费健康号
@@ -563,7 +592,7 @@ func Classify(status int, body string) ErrKind {
 	if sessionDeadRule.hit(body, lower) {
 		return ErrSessionDead
 	}
-	if accountFaultRule.hit(body, lower) {
+	if accountFaultRule.hit(body, lower) || channelBlockRule.hit(body, lower) {
 		return ErrAccountFault
 	}
 	// 14018 是明确的账号积分耗尽业务码。它必须先于通用 429 兜底，否则会被误判为

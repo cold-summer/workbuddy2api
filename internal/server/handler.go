@@ -1372,6 +1372,17 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
 			return
 		}
+		// 渠道校验封禁（11-128 "conversation id missing" / displayTips "channel verification"）：
+		// 与 11140 同属账号级终态——同一账号跨全模型、跨任意请求体 100% 复现（2026-10-16
+		// 实测 11/16 global 号全中），补上会话 ID 也不改变结果，换号是唯一出路。
+		// 硬禁用而非软冷却：冷却到期只会再撞一次、白耗一次轮换，还把「号已被上游封」这一
+		// 事实藏起来。禁用后 /status 以 disabled + disabled_reason 呈现；人工重登后用
+		// /admin/accounts/{uid}/revive 复活。disabled 号不参与选号，且不会被签到解冻
+		// （ReenableIfCredits 显式跳过）或保活刷新自动撤销。
+		if upstream.IsChannelBlocked(body) {
+			h.cfg.Pool.Disable(uid, "account blocked by upstream channel verification (11-128), re-login required")
+			return
+		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。

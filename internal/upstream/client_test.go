@@ -16,6 +16,11 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
+// channelBlockBody 上游渠道校验封禁的**真实响应体**（2026-10-16 逐账号直连上游抓取，
+// 原样保留）。msg 里的 "conversation id missing" 是幌子——实测补上会话 ID 结果不变；
+// 判别特征是 displayTips 的 "channel verification" / "渠道校验"。
+const channelBlockBody = `{"code":11-128,"msg":"conversation id missing","requestId":"08fec08a1c3e51ff50a380d4c93d4039","displayMsg":{"en":"Request blocked. Please send it again","zh":"请求被拦截，请重新发送","zh-hant":"請求已被攔截，請重新傳送"},"displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client. Please resend from the official client.","zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。","zh-hant":"本次呼叫未通過通路驗證，可能不是官方用戶端發出。請使用官方版本重新傳送。"},"actions":["EDIT_INPUT","SUBMIT_FEEDBACK"]}`
+
 func TestClassify(t *testing.T) {
 	cases := []struct {
 		status int
@@ -80,6 +85,14 @@ func TestClassify(t *testing.T) {
 		{403, `request illegal`, ErrAccountFault},
 		{429, `{"error":{"data":{"code":14017,"msg":"The trial version is not yet activated. Please log out of your current account and log in again to activate it immediately and start your free trial."}}}`, ErrAccountFault},
 		{400, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
+		// 渠道校验封禁（2026-10-16 实测）：HTTP 400 + code 11-128 + displayTips
+		// "channel verification" / "渠道校验"。实测为**账号维度**（16 个 global 号中
+		// 11 个 100% 复现、5 个 100% 成功，跨模型结论一致，补会话 ID 无效）→ 账号级终态。
+		// 只认文案不认 code 11-128：同码的 "blocked by security policy" 仍是内容拦截
+		// （上方既有用例），单凭 code 会把请求级拦截误判成账号封禁。
+		{400, channelBlockBody, ErrAccountFault},
+		{400, `This call failed channel verification, possibly because it was not sent from an official client.`, ErrAccountFault},
+		{400, `{"code":11-128,"msg":"x","displayTips":{"zh":"这次调用没通过渠道校验"}}`, ErrAccountFault},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
 		{401, `Offline user session not found`, ErrSessionDead},
@@ -1038,5 +1051,19 @@ func TestRefreshTokenExpiresInWithinCapApplied(t *testing.T) {
 	want := before + 5184000
 	if a.ExpiresAt < want-2 || a.ExpiresAt > want+2 {
 		t.Errorf("ExpiresAt=%d want ~%d (60d 正常推进)", a.ExpiresAt, want)
+	}
+}
+
+// TestIsChannelBlocked 渠道校验封禁识别：真实响应体为真；同码的内容策略拦截与正常响应为假
+// （判错会把健康的号永久禁用，或漏掉真封禁继续白耗轮换）。
+func TestIsChannelBlocked(t *testing.T) {
+	if !IsChannelBlocked(channelBlockBody) {
+		t.Error("真实渠道校验封禁体应判为 true")
+	}
+	if IsChannelBlocked(`{"code":11-128,"msg":"blocked by security policy"}`) {
+		t.Error("同码的内容策略拦截不应判为渠道封禁（否则误禁用账号）")
+	}
+	if IsChannelBlocked(`{"code":0,"msg":"ok"}`) {
+		t.Error("正常响应不应判为渠道封禁")
 	}
 }
