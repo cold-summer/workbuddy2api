@@ -820,8 +820,12 @@ func TestMetricsDefaults(t *testing.T) {
 	}
 }
 
-// TestMetricsEnvOverride 环境变量覆盖落盘路径与保留期。
-func TestMetricsEnvOverride(t *testing.T) {
+// TestMetricsPersistenceEnvOverride 环境变量覆盖落盘路径与保留期。
+//
+// 名字带 Persistence 是为与 metrics_config_test.go 的 TestMetricsEnvOverride
+// （WB2A_METRICS_ENABLED，Prometheus 开关）区分——两处 env 前缀同为 WB2A_METRICS_，
+// 但管的是 metrics 段里互不相关的两组键。
+func TestMetricsPersistenceEnvOverride(t *testing.T) {
 	t.Setenv("WB2A_METRICS_FILE", "/tmp/x/metrics.json")
 	t.Setenv("WB2A_METRICS_RETENTION_DAYS", "7")
 

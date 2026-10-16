@@ -46,7 +46,9 @@
     "audit_file": "./data/admin_audit.log"
   },
   "metrics": {
-    "enabled": false
+    "enabled": false,
+    "file": "./data/metrics.json",
+    "retention_days": 30
   },
   "alerting": {
     "enabled": false,

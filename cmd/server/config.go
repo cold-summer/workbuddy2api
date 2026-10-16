@@ -49,11 +49,20 @@ type Config struct {
 
 	Server struct{} `json:"server"` // 已退役段：max_body_mb 移除后无字段；旧配置该段下任意键因 JSON 未知字段而自然忽略
 
-	// Metrics 请求统计（/v1/stats）的落盘与保留期。
+	// Metrics 指标与请求统计段。两处独立来源合并于此，三个键互不依赖：
+	//   - enabled：Prometheus /metrics 端点开关（默认关闭）；
+	//   - file / retention_days：/v1/stats 的落盘与小时桶保留期。
+	// 关掉 Prometheus 端点不影响统计落盘，反之亦然。
 	//
 	// 为什么不复用上面已退役的 server 段：那段是历史包袱（max_body_mb 移除后留空壳），
 	// 往里塞新键会让「已退役」的注释变成谎话。
 	Metrics struct {
+		// Enabled Prometheus 指标端点开关。默认**关闭**：开启后 GET /metrics 暴露
+		// 进程内只读快照（账号池健康度 + 按模型的请求/延迟/token/积分），供 Prometheus
+		// 抓取与 Grafana 看板。与 /status、/v1/stats 同走 withAuth（同一个 api_key，
+		// 不另立指标密钥）；抓取端用 authorization/bearer_token 配置即可。
+		// 数据源全是进程内状态，scrape 不产生任何上游请求。
+		Enabled bool `json:"enabled"` // 默认 false
 		// File 统计落盘文件；空 = 纯内存（重启清零）。
 		// 相对路径按进程工作目录解析（systemd 下 = WorkingDirectory）。
 		File string `json:"file"`
@@ -91,15 +100,6 @@ type Config struct {
 		// 与 state_file 同约定：父目录由进程自建（NewAuditLog 会 MkdirAll）。
 		AuditFile string `json:"audit_file"`
 	} `json:"admin"`
-
-	// Metrics Prometheus 指标端点开关。默认**关闭**：开启后 GET /metrics 暴露
-	// 进程内只读快照（账号池健康度 + 按模型的请求/延迟/token/积分），供 Prometheus
-	// 抓取与 Grafana 看板。与 /status、/v1/stats 同走 withAuth（同一个 api_key，
-	// 不另立指标密钥）；抓取端用 authorization/bearer_token 配置即可。
-	// 数据源全是进程内状态，scrape 不产生任何上游请求。
-	Metrics struct {
-		Enabled bool `json:"enabled"` // 默认 false
-	} `json:"metrics"`
 
 	// Alerting 可用性阈值告警（webhook 推送）。默认**关闭**：关闭时不起 goroutine、
 	// 不发任何 HTTP，行为与改动前逐字一致。目标 URL 由运维自备（自建接收端或
